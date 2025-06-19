@@ -10,16 +10,14 @@ import pyroki as pk
 import viser
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
-
 import pyroki_snippets as pks
 
 
 def main():
     """Main function for basic IK."""
 
-    urdf = load_robot_description("panda_description")
-    target_link_name = "panda_hand"
-
+    urdf = load_robot_description("piper_description")
+    target_link_name = "gripper_base"
     # Create robot.
     robot = pk.Robot.from_urdf(urdf)
 
