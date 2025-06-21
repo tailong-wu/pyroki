@@ -7,30 +7,73 @@ import jax.numpy as jnp
 import jax_dataclasses as jdc
 import jaxlie
 import jaxls
+from jaxls import Cost, Var, VarValues
+
+# Custom cost functions added directly to the script
+@Cost.create_factory
+def midpoint_cost(
+    vals: VarValues,
+    robot: pk.Robot,
+    joint_var: Var[jax.Array],
+    target_position: jax.Array,
+    link1_index: int,
+    link2_index: int,
+    weight: float,
+) -> jax.Array:
+    """Computes the residual for matching the midpoint of two links to a target position."""
+    joint_cfg = vals[joint_var]
+    Ts_link_world = robot.forward_kinematics(joint_cfg)
+    pos1 = jaxlie.SE3(Ts_link_world[..., link1_index, :]).translation()
+    pos2 = jaxlie.SE3(Ts_link_world[..., link2_index, :]).translation()
+    midpoint = (pos1 + pos2) / 2.0
+    residual = midpoint - target_position
+    return (residual * weight).flatten()
+
+@Cost.create_factory
+def orientation_cost(
+    vals: VarValues,
+    robot: pk.Robot,
+    joint_var: Var[jax.Array],
+    target_orientation: jaxlie.SO3,
+    link_index: int,
+    weight: float,
+) -> jax.Array:
+    """Computes the residual for matching a link's orientation to a target orientation."""
+    joint_cfg = vals[joint_var]
+    Ts_link_world = robot.forward_kinematics(joint_cfg)
+    orientation_actual = jaxlie.SE3(Ts_link_world[..., link_index, :]).rotation()
+    residual = (orientation_actual.inverse() @ target_orientation).log()
+    return (residual * weight).flatten()
 
 def solve_ik(
     robot: pk.Robot,
-    target_link_name: str,
+    midpoint_link_names: list[str],
+    orientation_link_name: str,
     target_wxyz: np.ndarray,
     target_position: np.ndarray,
 ) -> np.ndarray:
     """
-    Solves the basic IK problem for a robot.
+    Solves the IK problem for a robot using a midpoint for position and another link for orientation.
 
     Args:
         robot: PyRoKi Robot.
-        target_link_name: String name of the link to be controlled.
+        midpoint_link_names: List of two link names for the midpoint position target.
+        orientation_link_name: String name of the link for the orientation target.
         target_wxyz: onp.ndarray. Target orientation.
         target_position: onp.ndarray. Target position.
 
     Returns:
         cfg: onp.ndarray. Shape: (robot.joint.actuated_count,).
     """
+    assert len(midpoint_link_names) == 2
     assert target_position.shape == (3,) and target_wxyz.shape == (4,)
-    target_link_index = robot.links.names.index(target_link_name)
+    midpoint_link_indices = jnp.array([robot.links.names.index(name) for name in midpoint_link_names])
+    orientation_link_index = robot.links.names.index(orientation_link_name)
+
     cfg = _solve_ik_jax(
         robot,
-        jnp.array(target_link_index),
+        midpoint_link_indices,
+        orientation_link_index,
         jnp.array(target_wxyz),
         jnp.array(target_position),
     )
@@ -41,21 +84,27 @@ def solve_ik(
 @jdc.jit
 def _solve_ik_jax(
     robot: pk.Robot,
-    target_link_index: jax.Array,
+    midpoint_link_indices: jax.Array,
+    orientation_link_index: jax.Array,
     target_wxyz: jax.Array,
     target_position: jax.Array,
 ) -> jax.Array:
     joint_var = robot.joint_var_cls(0)
     factors = [
-        pk.costs.pose_cost_analytic_jac(
+        midpoint_cost(
             robot,
             joint_var,
-            jaxlie.SE3.from_rotation_and_translation(
-                jaxlie.SO3(target_wxyz), target_position
-            ),
-            target_link_index,
-            pos_weight=50.0,
-            ori_weight=10.0,
+            target_position,
+            midpoint_link_indices[0],
+            midpoint_link_indices[1],
+            weight=50.0,
+        ),
+        orientation_cost(
+            robot,
+            joint_var,
+            jaxlie.SO3(target_wxyz),
+            orientation_link_index,
+            weight=10.0,
         ),
         pk.costs.limit_cost(
             robot,
@@ -90,7 +139,8 @@ def solve_ik_from_json(input_json_path, output_json_path):
     # Load the robot description
     urdf = load_robot_description("piper_description")
     robot = pk.Robot.from_urdf(urdf)
-    target_link_name = "gripper_base"
+    midpoint_link_names = ["link7", "link8"]
+    orientation_link_name = "gripper_base"
 
     joint_angle_seq = []
 
@@ -110,7 +160,8 @@ def solve_ik_from_json(input_json_path, output_json_path):
         # Solve IK
         solution = solve_ik(
             robot=robot,
-            target_link_name=target_link_name,
+            midpoint_link_names=midpoint_link_names,
+            orientation_link_name=orientation_link_name,
             target_position=target_position,
             target_wxyz=target_wxyz,
         )
