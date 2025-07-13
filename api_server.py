@@ -18,61 +18,70 @@ app = FastAPI()
 urdf = load_robot_description("piper_description")
 robot = pk.Robot.from_urdf(urdf)
 
-# --- Custom cost functions ---
+# TCP偏移量（沿gripper_base局部Z轴方向的距离）
+TCP_OFFSET_DISTANCE = 0.135283
+
+# --- 改进的成本函数 ---
 @Cost.create_factory
-def midpoint_cost(
+def tcp_position_cost(
     vals: VarValues,
     robot: pk.Robot,
     joint_var: Var[jax.Array],
     target_position: jax.Array,
-    link1_index: int,
-    link2_index: int,
+    gripper_base_index: int,
+    tcp_offset_distance: float,
     weight: float,
 ) -> jax.Array:
-    """Computes the residual for matching the midpoint of two links to a target position."""
+    """计算TCP位置与目标位置的残差（使用gripper_base + 沿Z轴偏移）"""
     joint_cfg = vals[joint_var]
     Ts_link_world = robot.forward_kinematics(joint_cfg)
-    pos1 = jaxlie.SE3(Ts_link_world[..., link1_index, :]).translation()
-    pos2 = jaxlie.SE3(Ts_link_world[..., link2_index, :]).translation()
-    midpoint = (pos1 + pos2) / 2.0
-    residual = midpoint - target_position
+    
+    # 获取gripper_base的变换矩阵
+    gripper_base_transform = jaxlie.SE3(Ts_link_world[..., gripper_base_index, :])
+    
+    # 计算真实TCP位置：gripper_base位置 + 沿局部Z轴方向的偏移
+    local_z_offset = jnp.array([0.0, 0.0, tcp_offset_distance])
+    tcp_position = gripper_base_transform.translation() + gripper_base_transform.rotation().apply(local_z_offset)
+    
+    residual = tcp_position - target_position
     return (residual * weight).flatten()
 
 @Cost.create_factory
-def orientation_cost(
+def tcp_orientation_cost(
     vals: VarValues,
     robot: pk.Robot,
     joint_var: Var[jax.Array],
     target_orientation: jaxlie.SO3,
-    link_index: int,
+    gripper_base_index: int,
     weight: float,
 ) -> jax.Array:
-    """Computes the residual for matching a link's orientation to a target orientation."""
+    """计算TCP方向与目标方向的残差（使用gripper_base方向）"""
     joint_cfg = vals[joint_var]
     Ts_link_world = robot.forward_kinematics(joint_cfg)
-    orientation_actual = jaxlie.SE3(Ts_link_world[..., link_index, :]).rotation()
+    orientation_actual = jaxlie.SE3(Ts_link_world[..., gripper_base_index, :]).rotation()
     residual = (orientation_actual.inverse() @ target_orientation).log()
     return (residual * weight).flatten()
 
-# --- IK Solver --- (This is the core logic from the previous script)
+# --- 改进的IK求解器 ---
 def solve_ik(
     robot: pk.Robot,
-    midpoint_link_names: list[str],
-    orientation_link_name: str,
     target_wxyz: np.ndarray,
     target_position: np.ndarray,
+    tcp_offset_distance: float = None,
 ) -> np.ndarray:
-    assert len(midpoint_link_names) == 2
+    """改进的IK求解器，使用gripper_base + 沿Z轴偏移作为真实TCP"""
     assert target_position.shape == (3,) and target_wxyz.shape == (4,)
-    midpoint_link_indices = jnp.array([robot.links.names.index(name) for name in midpoint_link_names])
-    orientation_link_index = robot.links.names.index(orientation_link_name)
+    if tcp_offset_distance is None:
+        tcp_offset_distance = TCP_OFFSET_DISTANCE
+    
+    gripper_base_index = robot.links.names.index('gripper_base')
 
     cfg = _solve_ik_jax(
         robot,
-        midpoint_link_indices,
-        orientation_link_index,
+        gripper_base_index,
         jnp.array(target_wxyz),
         jnp.array(target_position),
+        tcp_offset_distance,
     )
     assert cfg.shape == (robot.joints.num_actuated_joints,)
     return np.array(cfg)
@@ -80,26 +89,26 @@ def solve_ik(
 @jdc.jit
 def _solve_ik_jax(
     robot: pk.Robot,
-    midpoint_link_indices: jax.Array,
-    orientation_link_index: jax.Array,
+    gripper_base_index: jax.Array,
     target_wxyz: jax.Array,
     target_position: jax.Array,
+    tcp_offset_distance: float,
 ) -> jax.Array:
     joint_var = robot.joint_var_cls(0)
     factors = [
-        midpoint_cost(
+        tcp_position_cost(
             robot,
             joint_var,
             target_position,
-            midpoint_link_indices[0],
-            midpoint_link_indices[1],
+            gripper_base_index,
+            tcp_offset_distance,
             weight=50.0,
         ),
-        orientation_cost(
+        tcp_orientation_cost(
             robot,
             joint_var,
             jaxlie.SO3(target_wxyz),
-            orientation_link_index,
+            gripper_base_index,
             weight=10.0,
         ),
         pk.costs.limit_cost(
@@ -120,8 +129,7 @@ def _solve_ik_jax(
     return sol[joint_var]
 
 def calculate_joint_angles(ee_action_seq: List[List[float]]) -> List[List[float]]:
-    midpoint_link_names = ["link7", "link8"]
-    orientation_link_name = "gripper_base"
+    """改进的关节角度计算函数，使用精确的TCP位置"""
     joint_angle_seq = []
 
     for action in ee_action_seq:
@@ -134,8 +142,6 @@ def calculate_joint_angles(ee_action_seq: List[List[float]]) -> List[List[float]
 
         solution = solve_ik(
             robot=robot,
-            midpoint_link_names=midpoint_link_names,
-            orientation_link_name=orientation_link_name,
             target_position=target_position,
             target_wxyz=target_wxyz,
         )

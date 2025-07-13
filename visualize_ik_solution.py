@@ -30,6 +30,7 @@ def visualize_ik_solution(ee_action_file, joint_angles_file):
         pose = np.array(action[:7])
         position = tuple(pose[:3])
         wxyz = tuple([pose[6], pose[3], pose[4], pose[5]])
+        # wxyz = tuple([ pose[3], pose[4], pose[5],pose[6]])
         server.scene.add_transform_controls(
             f"/target_pose_{i}", scale=0.1, position=position, wxyz=wxyz
         )
